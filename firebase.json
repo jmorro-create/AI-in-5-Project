@@ -1,0 +1,34 @@
+{
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/api/**",
+        "run": {
+          "serviceId": "car-negotiator-agent",
+          "region": "us-east4"
+        }
+      },
+      {
+        "source": "/negotiator",
+        "destination": "/negotiator.html"
+      },
+      {
+        "source": "/otd-calculator",
+        "destination": "/otd-calculator.html"
+      },
+      {
+        "source": "**",
+        "destination": "/negotiator.html"
+      }
+    ]
+  }
+}

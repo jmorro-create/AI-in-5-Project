@@ -1,0 +1,36 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /scores/{scoreId} {
+      allow read: if true;
+      allow create: if request.resource.data.name is string
+                    && request.resource.data.name.size() == 3
+                    && request.resource.data.score is number;
+    }
+
+    match /negotiation_campaigns/{campaignId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                            && request.resource.data.vehicle is string
+                            && request.resource.data.deal_type in ['PURCHASE', 'LEASE'];
+      allow delete: if request.auth != null;
+    }
+
+    match /dealer_leads/{dealerId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                            && request.resource.data.dealer_name is string
+                            && request.resource.data.campaign_id is string;
+      allow delete: if request.auth != null;
+    }
+
+    match /message_queue/{messageId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                            && request.resource.data.dealer_id is string
+                            && request.resource.data.channel in ['EMAIL', 'SMS_PERSONAL', 'SMS_TWILIO']
+                            && request.resource.data.status in ['PENDING_APPROVAL', 'APPROVED_QUEUED', 'SENT', 'DELIVERED', 'RECEIVED', 'REJECTED'];
+      allow delete: if request.auth != null;
+    }
+  }
+}
