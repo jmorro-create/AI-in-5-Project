@@ -1,7 +1,4 @@
 {
-  "firestore": {
-    "rules": "firestore.rules"
-  },
   "hosting": {
     "public": "public",
     "ignore": [
@@ -10,13 +7,6 @@
       "**/node_modules/**"
     ],
     "rewrites": [
-      {
-        "source": "/api/**",
-        "run": {
-          "serviceId": "car-negotiator-agent",
-          "region": "us-east4"
-        }
-      },
       {
         "source": "/negotiator",
         "destination": "/negotiator.html"

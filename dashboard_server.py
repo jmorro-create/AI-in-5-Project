@@ -44,8 +44,6 @@ if __package__:
     )
     from .tools.context_memory import (
         PersistentFirestoreSessionService,
-        compact_conversation_history,
-        schedule_async_memory_consolidation,
     )
     from .tools.deal_tracker import (
         build_enriched_dealer_inventory,
@@ -74,7 +72,6 @@ if __package__:
     from .tools.guardrails import (
         DEFAULT_SAFETY_SETTINGS,
         evaluate_agent_response_policy,
-        select_model_for_task,
     )
     from .tools.inventory_scraper import (
         MONMOUTH_OCEAN_KIA_DEALERS,
@@ -93,7 +90,7 @@ if __package__:
         get_prevailing_market_benchmark,
         update_market_benchmark,
     )
-    from .tools.observability import log_structured_event, start_trace_span
+    from .tools.observability import log_structured_event
     from .tools.secret_manager import get_secret, load_local_env_file
 else:
     from agent import root_agent
@@ -106,8 +103,6 @@ else:
     )
     from tools.context_memory import (
         PersistentFirestoreSessionService,
-        compact_conversation_history,
-        schedule_async_memory_consolidation,
     )
     from tools.deal_tracker import (
         build_enriched_dealer_inventory,
@@ -136,7 +131,6 @@ else:
     from tools.guardrails import (
         DEFAULT_SAFETY_SETTINGS,
         evaluate_agent_response_policy,
-        select_model_for_task,
     )
     from tools.inventory_scraper import (
         MONMOUTH_OCEAN_KIA_DEALERS,
@@ -155,7 +149,7 @@ else:
         get_prevailing_market_benchmark,
         update_market_benchmark,
     )
-    from tools.observability import log_structured_event, start_trace_span
+    from tools.observability import log_structured_event
     from tools.secret_manager import get_secret, load_local_env_file
 
 _LOCAL_PUBLIC_DIR = BASE_DIR / "public"
@@ -307,361 +301,169 @@ async def _run_adk_agent_turn(
     agent_mode: str = "strategist",
     compared_dealer_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
-    """Executes a dynamic conversational turn against `root_agent` with persistent memory compaction, dynamic model routing, and OpenTelemetry tracing."""
+    """Executes a dynamic conversational turn against `root_agent` with persistent session history."""
     user_id = "monmouth_nj_buyer"
-    with start_trace_span(
-        "dashboard.agent_chat_turn",
-        attributes={"session_id": session_id, "agent_mode": agent_mode},
-    ):
-        dash = get_negotiation_dashboard()
-        dealers_ranked = dash.get("dealer_inventory") or dash.get("dealers_ranked") or []
-        best_offer = get_best_competing_offer()
-        target_dealer = _resolve_target_dealer_from_prompt(
-            prompt, selected_vin_context, dealers_ranked
-        )
-        context_block = _build_live_campaign_context_block(
-            target_dealer, dealers_ranked, best_offer, compared_dealer_ids
-        )
+    dash = get_negotiation_dashboard()
+    dealers_ranked = dash.get("dealer_inventory") or dash.get("dealers_ranked") or []
+    best_offer = get_best_competing_offer()
+    target_dealer = _resolve_target_dealer_from_prompt(
+        prompt, selected_vin_context, dealers_ranked
+    )
+    context_block = _build_live_campaign_context_block(
+        target_dealer, dealers_ranked, best_offer, compared_dealer_ids
+    )
 
-        # Load persistent session history from Firestore/local state and apply sliding-window compaction
-        persistent_session = _PERSISTENT_SESSION_SERVICE.get_or_create_session(
-            session_id=session_id,
-            user_id=user_id,
-            initial_state={
-                "zip_code": "07724",
-                "county": "Monmouth County, NJ",
-                "tax_rate_percent": 6.625,
-                "vehicle_requirement": "2027 Kia Telluride Hybrid",
-            },
-        )
-        history = _CHAT_HISTORY_BY_SESSION.setdefault(
-            session_id, list(persistent_session.get("history", []))
-        )
-        compaction_result = compact_conversation_history(
-            history,
-            max_recent_turns=4,
-            existing_summary=str(persistent_session.get("compacted_summary", "")),
-        )
-        recent_turns = compaction_result["recent_turns"]
-        compacted_summary = compaction_result["compacted_summary"]
+    persistent_session = _PERSISTENT_SESSION_SERVICE.get_or_create_session(
+        session_id=session_id,
+        user_id=user_id,
+        initial_state={
+            "zip_code": "07724",
+            "county": "Monmouth County, NJ",
+            "tax_rate_percent": 6.625,
+            "vehicle_requirement": "2027 Kia Telluride Hybrid",
+        },
+    )
+    history = _CHAT_HISTORY_BY_SESSION.setdefault(
+        session_id, list(persistent_session.get("history", []))
+    )
+    recent_turns = history[-4:]
 
-        recent_turns_text = ""
-        if compacted_summary:
-            recent_turns_text += (
-                "=== COMPACTED LONG-TERM SESSION MEMORY ===\n"
-                + compacted_summary
-                + "\n\n"
-            )
-        if recent_turns:
-            formatted_turns = [
-                f"User: {h['user']}\nAgent: {h['agent']}" for h in recent_turns
-            ]
-            recent_turns_text += (
-                "=== RECENT CONVERSATION HISTORY ===\n"
-                + "\n---\n".join(formatted_turns)
-                + "\n\n"
-            )
-
-        routing = select_model_for_task(prompt=prompt, agent_mode=agent_mode)
-        is_strategist = str(agent_mode).lower() != "auditor"
-        target_temp = float(routing["temperature"])
-        routed_model = str(routing["selected_model"])
-        mode_directive = (
-            "MODE: CREATIVE STRATEGIST (Conversational Deal Coach, Temperature=0.65). "
-            "Have a natural, direct, back-and-forth conversation with the buyer. Answer ONLY what they ask—never dump a canned scorecard or unrequested sections."
-            if is_strategist
-            else "MODE: STRICT DEAL AUDITOR (Precision Financial Auditor, Temperature=0.1). "
-            "Directly answer the buyer's exact math, fee, or audit question with precise numbers—no unrequested boilerplate."
-        )
-
-        # Pre-compute live math for any numbers in the prompt so the LLM has exact figures in 1 round-trip
-        v = target_dealer or {}
-        v_msrp = float(v.get("msrp") or 53890.0)
-        v_selling = float(v.get("selling_price") or 51842.0)
-        v_otd = float(v.get("otd_total") or 55303.11)
-        v_doc = float(v.get("doc_fee") or 499.0)
-        v_gov = float(v.get("gov_fees") or 385.0)
-        v_rebates = float(v.get("rebates") or 500.0)
-        v_addons = float(v.get("dealer_addons_total") or 0.0)
-        v_mf = float(v.get("money_factor") or 0.00190)
-        v_rv = float(v.get("residual_percent") or 62.0)
-
-        parsed_nums = _extract_custom_numbers(prompt, v_otd, v_selling)
-        eff_otd = float(parsed_nums["custom_otd"] or v_otd)
-        eff_down = float(parsed_nums["custom_down"] or 0.0)
-        eff_apr = float(parsed_nums["custom_apr"] or 4.9)
-
-        live_rev = calculate_monthly_from_otd(
-            otd_price=eff_otd,
-            msrp=v_msrp,
-            doc_fee=v_doc,
-            gov_fees=v_gov,
-            tax_rate_percent=6.625,
-            rebates=v_rebates,
-            cash_down_or_trade_equity=eff_down,
-            loan_apr_percent=eff_apr,
-            loan_term_months=60,
-            residual_percent=v_rv,
-            money_factor=v_mf,
-            lease_term_months=36,
-        )
-        live_b = live_rev["reverse_otd_breakdown"]
-        live_fin = live_rev["finance_purchase_from_otd"]
-        live_lse = live_rev["lease_from_otd_cap_cost"]
-
-        tool_calls_log: List[Dict[str, Any]] = [
-            {
-                "type": "call",
-                "name": "calculate_monthly_from_otd",
-                "args": {
-                    "otd_price": eff_otd,
-                    "msrp": v_msrp,
-                    "doc_fee": v_doc,
-                    "cash_down_or_trade_equity": eff_down,
-                    "loan_apr_percent": eff_apr,
-                },
-            },
-            {
-                "type": "response",
-                "name": "calculate_monthly_from_otd",
-                "response": live_rev,
-            },
+    recent_turns_text = ""
+    if recent_turns:
+        formatted_turns = [
+            f"User: {h['user']}\nAgent: {h['agent']}" for h in recent_turns
         ]
-
-        live_math_context = (
-            f"=== PRE-COMPUTED NJ FINANCIAL TELEMETRY (USE ONLY IF RELEVANT TO THE USER'S QUESTION) ===\n"
-            f"- Evaluated OTD: ${eff_otd:,.2f} (Cash Down: ${eff_down:,.0f}, APR: {eff_apr}%)\n"
-            f"- Implied Selling Price / Lease Cap Cost from ${eff_otd:,.2f} OTD: ${float(live_b['implied_selling_price_cap_cost']):,.2f} ({live_b['implied_discount_pct']}% off ${v_msrp:,.0f} MSRP)\n"
-            f"- Financed Purchase Monthly (${eff_down:,.0f} down @ {eff_apr}% APR): 48mo=${float(live_fin['monthly_48mo']):,.2f}/mo | 60mo=${float(live_fin['monthly_60mo']):,.2f}/mo | 72mo=${float(live_fin['monthly_72mo']):,.2f}/mo\n"
-            f"- 36mo/12k Hybrid Lease Monthly ({v_rv}% RV, {v_mf:.5f} MF): ${float(live_lse['total_monthly_payment']):,.2f}/mo (${float(live_lse['drive_off_due_at_signing']):,.2f} drive-off) or ${float(live_lse['sign_and_drive_zero_due_monthly']):,.2f}/mo Sign & Drive ($0 due)\n"
-            f"- Dealer Add-Ons on Worksheet: ${v_addons:,.0f} ({v.get('addon_descriptions') or 'None'})\n\n"
+        recent_turns_text += (
+            "=== RECENT CONVERSATION HISTORY ===\n"
+            + "\n---\n".join(formatted_turns)
+            + "\n\n"
         )
 
-        conversational_system_instruction = (
-            "You are the live, generative AI brain of `car_negotiator`, a personal Car Buying & Negotiation Coach "
-            "helping a buyer in Monmouth County, NJ (ZIP 07724, 6.625% NJ sales tax) buy or lease a 2027 Kia Telluride Hybrid.\n\n"
-            "CRITICAL CONVERSATIONAL RULES:\n"
-            "1. Be 100% conversational, natural, and generative. Directly answer the exact question or request the user just typed.\n"
-            "2. NEVER output a canned report template, never repeat the same fixed headings (like '### 🎯 Deal Evaluation' or '### 💬 Advisor Response'), "
-            "and NEVER dump unrequested sections (do not list 48/60/72-month payments, lease math, or dealer scripts unless the user's question actually asks for them or benefits from them).\n"
-            "3. Match the length and style of your reply to what the user asked: if they ask a quick question, give a crisp, direct conversational answer; "
-            "if they ask for deep strategy, math, or a draft email/text, provide a thoughtful, tailored response grounded in the live NJ campaign data.\n"
-            "4. Domain guardrails to keep in mind when drafting dealer messages: negotiate on Out-The-Door (OTD) price (never monthly payments with dealers), "
-            "never mention the buyer's trade-in or expiring December lease to a dealer before OTD is locked in writing, and avoid unprompted dealer-accounting jargon in outbound buyer messages unless the dealer brought up invoice/margin excuses first."
+    is_strategist = str(agent_mode).lower() != "auditor"
+    target_temp = 0.65 if is_strategist else 0.1
+    routed_model = "gemini-2.5-flash"
+    mode_directive = (
+        "MODE: CREATIVE STRATEGIST (Conversational Deal Coach, Temperature=0.65). "
+        "Have a natural, direct, back-and-forth conversation with the buyer. Answer ONLY what they ask—never dump a canned scorecard or unrequested sections."
+        if is_strategist
+        else "MODE: STRICT DEAL AUDITOR (Precision Financial Auditor, Temperature=0.1). "
+        "Directly answer the buyer's exact math, fee, or audit question with precise numbers—no unrequested boilerplate."
+    )
+
+    # Pre-compute live math for any numbers in the prompt so the LLM has exact figures in 1 round-trip
+    v = target_dealer or {}
+    v_msrp = float(v.get("msrp") or 53890.0)
+    v_selling = float(v.get("selling_price") or 51842.0)
+    v_otd = float(v.get("otd_total") or 55303.11)
+    v_doc = float(v.get("doc_fee") or 499.0)
+    v_gov = float(v.get("gov_fees") or 385.0)
+    v_rebates = float(v.get("rebates") or 500.0)
+    v_addons = float(v.get("dealer_addons_total") or 0.0)
+    v_mf = float(v.get("money_factor") or 0.00190)
+    v_rv = float(v.get("residual_percent") or 62.0)
+
+    parsed_nums = _extract_custom_numbers(prompt, v_otd, v_selling)
+    eff_otd = float(parsed_nums["custom_otd"] or v_otd)
+    eff_down = float(parsed_nums["custom_down"] or 0.0)
+    eff_apr = float(parsed_nums["custom_apr"] or 4.9)
+
+    live_rev = calculate_monthly_from_otd(
+        otd_price=eff_otd,
+        msrp=v_msrp,
+        doc_fee=v_doc,
+        gov_fees=v_gov,
+        tax_rate_percent=6.625,
+        rebates=v_rebates,
+        cash_down_or_trade_equity=eff_down,
+        loan_apr_percent=eff_apr,
+        loan_term_months=60,
+        residual_percent=v_rv,
+        money_factor=v_mf,
+        lease_term_months=36,
+    )
+    live_b = live_rev["reverse_otd_breakdown"]
+    live_fin = live_rev["finance_purchase_from_otd"]
+    live_lse = live_rev["lease_from_otd_cap_cost"]
+
+    tool_calls_log: List[Dict[str, Any]] = [
+        {
+            "type": "call",
+            "name": "calculate_monthly_from_otd",
+            "args": {
+                "otd_price": eff_otd,
+                "msrp": v_msrp,
+                "doc_fee": v_doc,
+                "cash_down_or_trade_equity": eff_down,
+                "loan_apr_percent": eff_apr,
+            },
+        },
+        {
+            "type": "response",
+            "name": "calculate_monthly_from_otd",
+            "response": live_rev,
+        },
+    ]
+
+    live_math_context = (
+        f"=== PRE-COMPUTED NJ FINANCIAL TELEMETRY (USE ONLY IF RELEVANT TO THE USER'S QUESTION) ===\n"
+        f"- Evaluated OTD: ${eff_otd:,.2f} (Cash Down: ${eff_down:,.0f}, APR: {eff_apr}%)\n"
+        f"- Implied Selling Price / Lease Cap Cost from ${eff_otd:,.2f} OTD: ${float(live_b['implied_selling_price_cap_cost']):,.2f} ({live_b['implied_discount_pct']}% off ${v_msrp:,.0f} MSRP)\n"
+        f"- Financed Purchase Monthly (${eff_down:,.0f} down @ {eff_apr}% APR): 48mo=${float(live_fin['monthly_48mo']):,.2f}/mo | 60mo=${float(live_fin['monthly_60mo']):,.2f}/mo | 72mo=${float(live_fin['monthly_72mo']):,.2f}/mo\n"
+        f"- 36mo/12k Hybrid Lease Monthly ({v_rv}% RV, {v_mf:.5f} MF): ${float(live_lse['total_monthly_payment']):,.2f}/mo (${float(live_lse['drive_off_due_at_signing']):,.2f} drive-off) or ${float(live_lse['sign_and_drive_zero_due_monthly']):,.2f}/mo Sign & Drive ($0 due)\n"
+        f"- Dealer Add-Ons on Worksheet: ${v_addons:,.0f} ({v.get('addon_descriptions') or 'None'})\n\n"
+    )
+
+    conversational_system_instruction = (
+        "You are the live, generative AI brain of `car_negotiator`, a personal Car Buying & Negotiation Coach "
+        "helping a buyer in Monmouth County, NJ (ZIP 07724, 6.625% NJ sales tax) buy or lease a 2027 Kia Telluride Hybrid.\n\n"
+        "CRITICAL CONVERSATIONAL RULES:\n"
+        "1. Be 100% conversational, natural, and generative. Directly answer the exact question or request the user just typed.\n"
+        "2. NEVER output a canned report template, never repeat the same fixed headings (like '### 🎯 Deal Evaluation' or '### 💬 Advisor Response'), "
+        "and NEVER dump unrequested sections (do not list 48/60/72-month payments, lease math, or dealer scripts unless the user's question actually asks for them or benefits from them).\n"
+        "3. Match the length and style of your reply to what the user asked: if they ask a quick question, give a crisp, direct conversational answer; "
+        "if they ask for deep strategy, math, or a draft email/text, provide a thoughtful, tailored response grounded in the live NJ campaign data.\n"
+        "4. Domain guardrails to keep in mind when drafting dealer messages: negotiate on Out-The-Door (OTD) price (never monthly payments with dealers), "
+        "never mention the buyer's trade-in or expiring December lease to a dealer before OTD is locked in writing, and avoid unprompted dealer-accounting jargon in outbound buyer messages unless the dealer brought up invoice/margin excuses first."
+    )
+
+    enriched_prompt = (
+        f"{context_block}\n"
+        f"{live_math_context}"
+        f"{recent_turns_text}"
+        f"=== AGENT OPERATING MODE ===\n{mode_directive}\n\n"
+        f"=== USER'S MESSAGE ===\n"
+        f"{prompt}\n\n"
+        f"Reply directly and naturally to the user's message above."
+    )
+
+    def _persist_turn(reply_text: str) -> Dict[str, Any]:
+        eval_report = evaluate_agent_response_policy(
+            response_text=reply_text,
+            dealer_initiated_jargon=dealer_initiated_accounting_jargon(prompt),
+            otd_locked_in_writing=bool(target_dealer.get("otd_locked_in_writing", False)),
         )
-
-        enriched_prompt = (
-            f"{context_block}\n"
-            f"{live_math_context}"
-            f"{recent_turns_text}"
-            f"=== AGENT OPERATING MODE ===\n{mode_directive}\n\n"
-            f"=== USER'S MESSAGE ===\n"
-            f"{prompt}\n\n"
-            f"Reply directly and naturally to the user's message above."
+        safe_reply = str(eval_report["sanitized_text"])
+        history.append({"user": prompt, "agent": safe_reply})
+        _PERSISTENT_SESSION_SERVICE.append_turn(
+            session_id=session_id,
+            user_message=prompt,
+            agent_reply=safe_reply,
+            user_id=user_id,
         )
+        return eval_report
 
-        def _persist_turn(reply_text: str) -> Dict[str, Any]:
-            eval_report = evaluate_agent_response_policy(
-                response_text=reply_text,
-                dealer_initiated_jargon=dealer_initiated_accounting_jargon(prompt),
-                otd_locked_in_writing=bool(target_dealer.get("otd_locked_in_writing", False)),
-            )
-            safe_reply = str(eval_report["sanitized_text"])
-            history.append({"user": prompt, "agent": safe_reply})
-            _PERSISTENT_SESSION_SERVICE.append_turn(
-                session_id=session_id,
-                user_message=prompt,
-                agent_reply=safe_reply,
-                user_id=user_id,
-            )
-            schedule_async_memory_consolidation(
-                session_id=session_id,
-                turns=history,
-                dealer_id=str(target_dealer.get("id", "")),
-            )
-            return eval_report
+    import time
 
-        import time
-
-        global _LLM_QUOTA_COOLDOWN_UNTIL
-        now_ts = time.time()
-        api_key = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
-        has_api_key = bool(api_key)
-        if (
-            genai_types is None
-            or (genai is None and _ADK_RUNNER is None)
-            or not has_api_key
-            or now_ts < globals().get("_LLM_QUOTA_COOLDOWN_UNTIL", 0.0)
-        ):
-            advisor_res = _dynamic_conversational_deal_advisor(
-                prompt=prompt,
-                target_dealer=target_dealer,
-                dealers_ranked=dealers_ranked,
-                best_offer=best_offer,
-                session_id=session_id,
-                agent_mode=agent_mode,
-                compared_dealer_ids=compared_dealer_ids,
-            )
-            eval_report = _persist_turn(advisor_res["reply"])
-            advisor_res["reply"] = eval_report["sanitized_text"]
-            advisor_res["self_evaluation"] = eval_report
-            advisor_res["model_routing"] = routing
-            return advisor_res
-
-        if _SESSION_SERVICE is not None:
-            existing = await _SESSION_SERVICE.get_session(
-                app_name="car_negotiator", user_id=user_id, session_id=session_id
-            )
-            if not existing:
-                await _SESSION_SERVICE.create_session(
-                    app_name="car_negotiator",
-                    user_id=user_id,
-                    session_id=session_id,
-                    state={
-                        "zip_code": "07724",
-                        "county": "Monmouth County, NJ",
-                        "tax_rate_percent": 6.625,
-                        "vehicle_requirement": "2027 Kia Telluride Hybrid",
-                    },
-                )
-
-        content = genai_types.Content(
-            role="user", parts=[genai_types.Part.from_text(text=enriched_prompt)]
-        )
-
-        reply_chunks: List[Dict[str, Any] | str] = []
-
-        # 1. Primary Live Generative Gemini Call (`gemini-flash-latest` -> `gemini-flash-lite-latest`)
-        if genai is not None:
-            cascade_models = [
-                "gemini-flash-latest",
-                "gemini-flash-lite-latest",
-                routed_model,
-            ]
-            seen_models = set()
-            ordered_models = []
-            for m in cascade_models:
-                if m and m not in seen_models:
-                    seen_models.add(m)
-                    ordered_models.append(m)
-            try:
-                saved_proj = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
-                saved_loc = os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
-                try:
-                    client = genai.Client(api_key=api_key)
-                finally:
-                    if saved_proj is not None:
-                        os.environ["GOOGLE_CLOUD_PROJECT"] = saved_proj
-                    if saved_loc is not None:
-                        os.environ["GOOGLE_CLOUD_LOCATION"] = saved_loc
-                for alt_model in ordered_models:
-                    try:
-                        resp = client.models.generate_content(
-                            model=alt_model,
-                            contents=enriched_prompt,
-                            config=genai_types.GenerateContentConfig(
-                                system_instruction=conversational_system_instruction,
-                                temperature=target_temp,
-                                safety_settings=DEFAULT_SAFETY_SETTINGS,
-                            ),
-                        )
-                        if resp and resp.text:
-                            reply_text = resp.text.strip()
-                            eval_report = _persist_turn(reply_text)
-                            routing_copy = dict(routing)
-                            routing_copy["selected_model"] = alt_model
-                            return {
-                                "ok": True,
-                                "mode": f"ADK_LIVE_LLM ({alt_model} • temp={target_temp})",
-                                "agent_mode": agent_mode,
-                                "temperature": target_temp,
-                                "model": alt_model,
-                                "model_routing": routing_copy,
-                                "self_evaluation": eval_report,
-                                "reply": eval_report["sanitized_text"],
-                                "tool_events": tool_calls_log,
-                            }
-                    except Exception as model_exc:
-                        log_structured_event(
-                            "dashboard.gemini_cascade_retry",
-                            level="WARNING",
-                            model=alt_model,
-                            error=str(model_exc)[:200],
-                        )
-                        continue
-            except Exception as client_exc:
-                log_structured_event(
-                    "dashboard.gemini_client_warning",
-                    level="WARNING",
-                    error=str(client_exc)[:200],
-                )
-
-        # 2. Try primary Google ADK Runner (`root_agent`)
-        try:
-            root_agent.generate_content_config = genai_types.GenerateContentConfig(
-                temperature=target_temp,
-                safety_settings=DEFAULT_SAFETY_SETTINGS,
-            )
-            async for event in _ADK_RUNNER.run_async(
-                user_id=user_id, session_id=session_id, new_message=content
-            ):
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if part.function_call:
-                            tool_calls_log.append(
-                                {
-                                    "type": "call",
-                                    "name": part.function_call.name,
-                                    "args": dict(part.function_call.args or {}),
-                                }
-                            )
-                        if part.function_response:
-                            tool_calls_log.append(
-                                {
-                                    "type": "response",
-                                    "name": part.function_response.name,
-                                    "response": part.function_response.response,
-                                }
-                            )
-                        if part.text:
-                            reply_chunks.append(part.text)
-            final_text = "\n".join(t for t in reply_chunks if t.strip()).strip()
-            if final_text:
-                eval_report = _persist_turn(final_text)
-                return {
-                    "ok": True,
-                    "mode": f"ADK_LIVE_AGENT (temp={target_temp})",
-                    "agent_mode": agent_mode,
-                    "temperature": target_temp,
-                    "model": root_agent.model,
-                    "model_routing": routing,
-                    "self_evaluation": eval_report,
-                    "reply": eval_report["sanitized_text"],
-                    "tool_events": tool_calls_log,
-                }
-        except Exception as primary_exc:
-            _LLM_QUOTA_COOLDOWN_UNTIL = time.time() + 45.0
-            log_structured_event(
-                "dashboard.adk_runner_fallback",
-                level="WARNING",
-                error=str(primary_exc)[:200],
-            )
-            advisor_res = _dynamic_conversational_deal_advisor(
-                prompt=prompt,
-                target_dealer=target_dealer,
-                dealers_ranked=dealers_ranked,
-                best_offer=best_offer,
-                session_id=session_id,
-                agent_mode=agent_mode,
-                compared_dealer_ids=compared_dealer_ids,
-            )
-            advisor_res["fallback_reason"] = str(primary_exc)
-            eval_report = _persist_turn(advisor_res["reply"])
-            advisor_res["reply"] = eval_report["sanitized_text"]
-            advisor_res["self_evaluation"] = eval_report
-            advisor_res["model_routing"] = routing
-            return advisor_res
-
+    global _LLM_QUOTA_COOLDOWN_UNTIL
+    now_ts = time.time()
+    api_key = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
+    has_api_key = bool(api_key)
+    if (
+        genai_types is None
+        or (genai is None and _ADK_RUNNER is None)
+        or not has_api_key
+        or now_ts < globals().get("_LLM_QUOTA_COOLDOWN_UNTIL", 0.0)
+    ):
         advisor_res = _dynamic_conversational_deal_advisor(
             prompt=prompt,
             target_dealer=target_dealer,
@@ -674,8 +476,170 @@ async def _run_adk_agent_turn(
         eval_report = _persist_turn(advisor_res["reply"])
         advisor_res["reply"] = eval_report["sanitized_text"]
         advisor_res["self_evaluation"] = eval_report
-        advisor_res["model_routing"] = routing
         return advisor_res
+
+    if _SESSION_SERVICE is not None:
+        existing = await _SESSION_SERVICE.get_session(
+            app_name="car_negotiator", user_id=user_id, session_id=session_id
+        )
+        if not existing:
+            await _SESSION_SERVICE.create_session(
+                app_name="car_negotiator",
+                user_id=user_id,
+                session_id=session_id,
+                state={
+                    "zip_code": "07724",
+                    "county": "Monmouth County, NJ",
+                    "tax_rate_percent": 6.625,
+                    "vehicle_requirement": "2027 Kia Telluride Hybrid",
+                },
+            )
+
+    content = genai_types.Content(
+        role="user", parts=[genai_types.Part.from_text(text=enriched_prompt)]
+    )
+
+    reply_chunks: List[Dict[str, Any] | str] = []
+
+    # 1. Primary Live Generative Gemini Call (`gemini-flash-latest` -> `gemini-flash-lite-latest`)
+    if genai is not None:
+        cascade_models = [
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            routed_model,
+        ]
+        seen_models = set()
+        ordered_models = []
+        for m in cascade_models:
+            if m and m not in seen_models:
+                seen_models.add(m)
+                ordered_models.append(m)
+        try:
+            saved_proj = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+            saved_loc = os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
+            try:
+                client = genai.Client(api_key=api_key)
+            finally:
+                if saved_proj is not None:
+                    os.environ["GOOGLE_CLOUD_PROJECT"] = saved_proj
+                if saved_loc is not None:
+                    os.environ["GOOGLE_CLOUD_LOCATION"] = saved_loc
+            for alt_model in ordered_models:
+                try:
+                    resp = client.models.generate_content(
+                        model=alt_model,
+                        contents=enriched_prompt,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=conversational_system_instruction,
+                            temperature=target_temp,
+                            safety_settings=DEFAULT_SAFETY_SETTINGS,
+                        ),
+                    )
+                    if resp and resp.text:
+                        reply_text = resp.text.strip()
+                        eval_report = _persist_turn(reply_text)
+                        return {
+                            "ok": True,
+                            "mode": f"ADK_LIVE_LLM ({alt_model} • temp={target_temp})",
+                            "agent_mode": agent_mode,
+                            "temperature": target_temp,
+                            "model": alt_model,
+                            "self_evaluation": eval_report,
+                            "reply": eval_report["sanitized_text"],
+                            "tool_events": tool_calls_log,
+                        }
+                except Exception as model_exc:
+                    log_structured_event(
+                        "dashboard.gemini_cascade_retry",
+                        level="WARNING",
+                        model=alt_model,
+                        error=str(model_exc)[:200],
+                    )
+                    continue
+        except Exception as client_exc:
+            log_structured_event(
+                "dashboard.gemini_client_warning",
+                level="WARNING",
+                error=str(client_exc)[:200],
+            )
+
+    # 2. Try primary Google ADK Runner (`root_agent`)
+    try:
+        root_agent.generate_content_config = genai_types.GenerateContentConfig(
+            temperature=target_temp,
+            safety_settings=DEFAULT_SAFETY_SETTINGS,
+        )
+        async for event in _ADK_RUNNER.run_async(
+            user_id=user_id, session_id=session_id, new_message=content
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.function_call:
+                        tool_calls_log.append(
+                            {
+                                "type": "call",
+                                "name": part.function_call.name,
+                                "args": dict(part.function_call.args or {}),
+                            }
+                        )
+                    if part.function_response:
+                        tool_calls_log.append(
+                            {
+                                "type": "response",
+                                "name": part.function_response.name,
+                                "response": part.function_response.response,
+                            }
+                        )
+                    if part.text:
+                        reply_chunks.append(part.text)
+        final_text = "\n".join(t for t in reply_chunks if t.strip()).strip()
+        if final_text:
+            eval_report = _persist_turn(final_text)
+            return {
+                "ok": True,
+                "mode": f"ADK_LIVE_AGENT (temp={target_temp})",
+                "agent_mode": agent_mode,
+                "temperature": target_temp,
+                "model": root_agent.model,
+                "self_evaluation": eval_report,
+                "reply": eval_report["sanitized_text"],
+                "tool_events": tool_calls_log,
+            }
+    except Exception as primary_exc:
+        _LLM_QUOTA_COOLDOWN_UNTIL = time.time() + 45.0
+        log_structured_event(
+            "dashboard.adk_runner_fallback",
+            level="WARNING",
+            error=str(primary_exc)[:200],
+        )
+        advisor_res = _dynamic_conversational_deal_advisor(
+            prompt=prompt,
+            target_dealer=target_dealer,
+            dealers_ranked=dealers_ranked,
+            best_offer=best_offer,
+            session_id=session_id,
+            agent_mode=agent_mode,
+            compared_dealer_ids=compared_dealer_ids,
+        )
+        advisor_res["fallback_reason"] = str(primary_exc)
+        eval_report = _persist_turn(advisor_res["reply"])
+        advisor_res["reply"] = eval_report["sanitized_text"]
+        advisor_res["self_evaluation"] = eval_report
+        return advisor_res
+
+    advisor_res = _dynamic_conversational_deal_advisor(
+        prompt=prompt,
+        target_dealer=target_dealer,
+        dealers_ranked=dealers_ranked,
+        best_offer=best_offer,
+        session_id=session_id,
+        agent_mode=agent_mode,
+        compared_dealer_ids=compared_dealer_ids,
+    )
+    eval_report = _persist_turn(advisor_res["reply"])
+    advisor_res["reply"] = eval_report["sanitized_text"]
+    advisor_res["self_evaluation"] = eval_report
+    return advisor_res
 
 
 def _extract_custom_numbers(prompt: str, default_otd: float, default_selling: float) -> Dict[str, float | None]:

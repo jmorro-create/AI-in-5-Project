@@ -290,28 +290,24 @@ Then open **`http://localhost:8090/negotiator.html`** in your browser.
 
 ---
 
-## 8. AgentOps Production Architecture & Infrastructure as Code (IaC)
+## 8. AgentOps Production Architecture
 
-The codebase implements the **AgentOps Code Review Matrix** across 5 pillars:
+The codebase implements:
 
 1. **Tool & Interface Design (`tools/schemas.py`)**:
    - Complete Google-style `Args:` and `Returns:` docstrings on every tool.
    - Strict Pydantic `BaseModel` input validation (`OTDCalculationInputSchema`, `CalculateNJPaymentsInputSchema`, `AuditUploadedLeaseSheetInputSchema`, `ReverseOTDInputSchema`, `LeaseCalculationInputSchema`, `AuditDealerQuoteInputSchema`, `MarketBenchmarkUpdateInputSchema`, `QueueDealerMessageInputSchema`).
    - Guided error handling (`build_guided_error` and `validate_tool_input`) returning structured `recovery_instructions` so the LLM can self-recover without crashing.
 2. **Context & Memory (`tools/context_memory.py` & `tools/firestore_sync.py`)**:
-   - Sliding-window conversation compaction (`compact_conversation_history`), ADK `EventsCompactionConfig`, and local context cache digest (`create_or_get_gemini_context_cache`).
    - Persistent session state via `PersistentFirestoreSessionService` with bidirectional Cloud Firestore REST read/write sync (`fetch_doc_from_firestore` + `sync_doc_to_firestore`).
    - Local semantic deal memory (`SemanticDealMemoryStore` + `search_negotiation_memory` tool) backed by `data/vector_memory.json`.
 3. **Orchestration, Guardrails & Multi-Agent Workflows (`agent.py` & `tools/guardrails.py`)**:
    - **Hybrid Coordinator Pattern**: `root_agent` coordinates 3 specialized `LlmAgent` sub-agents (`inventory_research_agent`, `financial_auditor_agent`, `negotiation_comms_agent`) and a deterministic 2-step `SequentialAgent` workflow (`deal_audit_and_counter_pipeline`).
-   - **Dynamic Model Routing (`select_model_for_task`)**: Routes simple lookups to `gemini-2.5-flash` and complex multi-vehicle/lease-vs-buy reasoning to `gemini-2.5-pro`.
    - **Safety & Self-Evaluation Callbacks**: Enforces `DEFAULT_SAFETY_SETTINGS`, `before_model_guardrail_callback`, `after_model_self_eval_callback` (`evaluate_agent_response_policy`), `before_tool_guardrail_callback`, `after_tool_guardrail_callback`, and `require_human_confirmation_hook` (defaulting high-stakes outreach to `COPILOT` / `PENDING_APPROVAL`).
-4. **Observability, Tracing & PII Redaction (`tools/observability.py`)**:
-   - Structured JSON logging (`StructuredJsonFormatter`), lightweight `contextvars` span correlation (`start_trace_span`), and `@instrument_tool` pre/post tool execution logging (`log_tool_intent` / `log_tool_outcome`).
-   - Deterministic regex PII scrubbing (`redact_pii`) across logs, spans, and memory entries while preserving 17-character VINs.
-5. **Infrastructure as Code & Secret Management (`Dockerfile`, `firebase.json`, `firestore.rules`, `tools/secret_manager.py`)**:
-   - Containerized deployment via `Dockerfile`, Firebase configuration (`firebase.json`), and secret resolution via `tools/secret_manager.py` (with zero hardcoded API keys).
-   - Production `firestore.rules` enforcing `request.auth != null`, ownership checks, document ID consistency, and field schema bounds across `/negotiation_campaigns`, `/dealer_leads`, `/message_queue`, and `/chat_sessions`.
+4. **Observability (`tools/observability.py`)**:
+   - Structured JSON logging (`StructuredJsonFormatter`) and `@instrument_tool` pre/post tool execution logging (`log_tool_intent` / `log_tool_outcome`).
+5. **Secret Management & Configuration (`firebase.json`, `requirements.txt`, `tools/secret_manager.py`)**:
+   - Secret resolution via `tools/secret_manager.py` (with zero hardcoded API keys) and Firebase Hosting configuration (`firebase.json`).
 
 ---
 

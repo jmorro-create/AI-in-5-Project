@@ -72,8 +72,6 @@ if __package__:
         audit_uploaded_lease_sheet,
         before_model_guardrail_callback,
         before_tool_guardrail_callback,
-        build_adk_context_cache_config,
-        build_adk_events_compaction_config,
         calculate_color_parity_benchmark,
         calculate_lease_payment as _calculate_lease_payment,
         calculate_monthly_from_otd as _calculate_monthly_from_otd,
@@ -116,8 +114,6 @@ else:
         audit_uploaded_lease_sheet,
         before_model_guardrail_callback,
         before_tool_guardrail_callback,
-        build_adk_context_cache_config,
-        build_adk_events_compaction_config,
         calculate_color_parity_benchmark,
         calculate_lease_payment as _calculate_lease_payment,
         calculate_monthly_from_otd as _calculate_monthly_from_otd,
@@ -630,14 +626,7 @@ root_agent = LlmAgent(
 )
 setattr(root_agent, "agent_display_name", "Herbie")
 
-# ADK App with Context Compaction and Context Caching enabled
 app = App(
     name="car_negotiator",
     root_agent=root_agent,
-    events_compaction_config=build_adk_events_compaction_config(
-        compaction_interval=5, overlap_size=2
-    ),
-    context_cache_config=build_adk_context_cache_config(
-        min_tokens=1024, ttl_seconds=3600
-    ),
 )

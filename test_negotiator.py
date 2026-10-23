@@ -8,12 +8,12 @@ Tests:
 5. Monmouth & Ocean County, NJ dealership priority, 2027 Kia Telluride Hybrid requirement, Trim Priority (#1 Hybrid SX X-Line, #2 Hybrid SX Prestige, #3 Hybrid SX Prestige X-Line), and Non-Black Interior preference
 6. Dynamic Prevailing Market Comps Benchmark (`get_prevailing_market_benchmark` & `update_market_benchmark`)
 7. Multi-round 3-dealer 2027 Kia Telluride Hybrid IN-TRANSIT competitive negotiation simulation
-8. AgentOps Code Review Matrix (19/19 Criteria):
+8. AgentOps Production Architecture:
    - Tool docstrings (`Args:` / `Returns:`), Pydantic input/output schemas, and guided error recovery instructions
-   - Sliding-window conversation compaction, prompt caching config, persistent session service, and semantic RAG memory
-   - Multi-agent orchestration (`sub_agents` + `SequentialAgent`), dynamic Flash/Pro routing, safety guardrails, and self-evaluation
-   - Structured JSON logging, OpenTelemetry distributed trace spans, pre/post tool logging, and Cloud DLP / regex PII redaction
-   - Secret Manager integration (no hardcoded API keys in `.env`), Terraform IaC, Dockerfile, and production Firestore security rules
+   - Persistent session service (`PersistentFirestoreSessionService`) and semantic RAG memory (`SemanticDealMemoryStore`)
+   - Multi-agent orchestration (`sub_agents` + `SequentialAgent`), safety guardrails, self-evaluation, and HITL confirmation hooks
+   - Structured JSON logging and `@instrument_tool` pre/post tool execution logging
+   - Secret Manager integration (no hardcoded API keys in `.env`) and Firebase configuration (`firebase.json`, `requirements.txt`)
 """
 
 from pathlib import Path
@@ -39,47 +39,43 @@ if __package__:
         OTDCalculationOutputSchema,
         PersistentFirestoreSessionService,
         approve_queued_message,
-        async_upsert_document,
         audit_dealer_quote,
         calculate_color_parity_benchmark,
         calculate_lease_payment,
         calculate_monthly_from_otd,
         calculate_otd_price,
         calculate_trade_in_impact,
-        compact_conversation_history,
-        create_or_get_gemini_context_cache,
         dealer_initiated_accounting_jargon,
         dispatch_ready_messages,
         evaluate_agent_response_policy,
-        flush_async_persistence_queue,
         generate_natural_buyer_counter,
         get_best_competing_offer,
+        get_dealer_conversation_thread,
+        get_live_comms_configuration_status,
         get_negotiation_dashboard,
         get_prevailing_market_benchmark,
         get_secret,
-        get_trace_history,
+        get_transport_mode,
+        ingest_live_dealer_message,
+        is_placeholder_contact,
+        log_structured_event,
+        log_tool_intent,
+        log_tool_outcome,
         parse_and_log_dealer_reply,
         queue_dealer_message,
         record_dealer_quote,
-        redact_pii,
         require_human_confirmation_hook,
         run_autonomous_multi_dealer_negotiation,
         search_negotiation_memory,
         seed_sample_negotiation_campaign,
-        select_model_for_task,
         send_via_personal_gmail,
         set_dealer_trade_in_gate,
         set_transport_mode,
         simulate_dealer_reply,
-        start_trace_span,
         update_dealer_contact_info,
         update_market_benchmark,
         upsert_dealer_lead,
-        get_dealer_conversation_thread,
-        get_live_comms_configuration_status,
-        get_transport_mode,
-        ingest_live_dealer_message,
-        is_placeholder_contact,
+        upsert_document,
     )
     from .tools.inventory_scraper import (
         MONMOUTH_OCEAN_KIA_DEALERS,
@@ -102,19 +98,15 @@ else:
         OTDCalculationOutputSchema,
         PersistentFirestoreSessionService,
         approve_queued_message,
-        async_upsert_document,
         audit_dealer_quote,
         calculate_color_parity_benchmark,
         calculate_lease_payment,
         calculate_monthly_from_otd,
         calculate_otd_price,
         calculate_trade_in_impact,
-        compact_conversation_history,
-        create_or_get_gemini_context_cache,
         dealer_initiated_accounting_jargon,
         dispatch_ready_messages,
         evaluate_agent_response_policy,
-        flush_async_persistence_queue,
         generate_natural_buyer_counter,
         get_best_competing_offer,
         get_dealer_conversation_thread,
@@ -122,27 +114,27 @@ else:
         get_negotiation_dashboard,
         get_prevailing_market_benchmark,
         get_secret,
-        get_trace_history,
         get_transport_mode,
         ingest_live_dealer_message,
         is_placeholder_contact,
+        log_structured_event,
+        log_tool_intent,
+        log_tool_outcome,
         parse_and_log_dealer_reply,
         queue_dealer_message,
         record_dealer_quote,
-        redact_pii,
         require_human_confirmation_hook,
         run_autonomous_multi_dealer_negotiation,
         search_negotiation_memory,
         seed_sample_negotiation_campaign,
-        select_model_for_task,
         send_via_personal_gmail,
         set_dealer_trade_in_gate,
         set_transport_mode,
         simulate_dealer_reply,
-        start_trace_span,
         update_dealer_contact_info,
         update_market_benchmark,
         upsert_dealer_lead,
+        upsert_document,
     )
     from tools.inventory_scraper import (
         MONMOUTH_OCEAN_KIA_DEALERS,
@@ -579,37 +571,18 @@ class TestCarNegotiator(unittest.TestCase):
         valid_in = OTDCalculationInputSchema(msrp=53890.0, selling_price=51842.0)
         self.assertEqual(valid_in.msrp, 53890.0)
 
-    def test_context_compaction_persistent_sessions_and_semantic_memory(self):
-        # 1. Sliding-window conversation compaction
-        sample_turns = [
-            {"user": f"Turn {i} question about Raceway Kia $55,{100+i} OTD on VIN 5XYPDESA8VG041820", "agent": f"Turn {i} answer"}
-            for i in range(8)
-        ]
-        compacted = compact_conversation_history(sample_turns, max_recent_turns=3)
-        self.assertEqual(len(compacted["recent_turns"]), 3)
-        self.assertEqual(compacted["compacted_turn_count"], 5)
-        self.assertIn("Compacted Session Context", compacted["compacted_summary"])
-
-        # 2. PersistentFirestoreSessionService
+    def test_persistent_sessions_and_semantic_memory(self):
+        # 1. PersistentFirestoreSessionService
         session_svc = PersistentFirestoreSessionService()
         session_svc.append_turn(
             session_id="test-session-agentops",
-            user_message="My email is buyer@example.com and I want $54,600 OTD.",
+            user_message="I am looking to lock $54,600 OTD.",
             agent_reply="Got it, targeting $54,600 OTD.",
         )
         loaded_sess = session_svc.get_or_create_session("test-session-agentops")
         self.assertGreaterEqual(len(loaded_sess["history"]), 1)
-        # Verify PII was scrubbed in stored session history
-        self.assertIn("[REDACTED_EMAIL]", loaded_sess["history"][-1]["user"])
 
-        # 3. Context cache metadata helper
-        cache_meta = create_or_get_gemini_context_cache(
-            system_instruction=root_agent.instruction,
-            benchmark_payload={"zip": "07724", "tax": 6.625},
-        )
-        self.assertIn("cache_key", cache_meta)
-
-        # 4. Semantic Deal Memory RAG search
+        # 2. Semantic Deal Memory RAG search
         mem_res = search_negotiation_memory(
             query="Monmouth County NJ Telluride Hybrid SX X-Line invoice holdback discount",
             top_k=3,
@@ -617,18 +590,10 @@ class TestCarNegotiator(unittest.TestCase):
         self.assertTrue(mem_res["ok"])
         self.assertGreaterEqual(mem_res["results_count"], 1)
 
-    def test_guardrails_dynamic_model_routing_and_human_confirmation_gate(self):
-        # 1. Dynamic model routing (Flash vs Pro)
-        simple_route = select_model_for_task("What is the doc fee at Raceway Kia?", agent_mode="auditor")
-        complex_route = select_model_for_task(
-            "Compare all 3 vehicles side by side across SX X-Line vs SX Prestige X-Line and model lease vs buy with trade-in tax credit",
-            agent_mode="strategist",
-        )
-        self.assertEqual(simple_route["selected_model"], "gemini-2.5-flash")
-        self.assertEqual(complex_route["selected_model"], "gemini-2.5-pro")
+    def test_guardrails_and_human_confirmation_gate(self):
         self.assertGreaterEqual(len(DEFAULT_SAFETY_SETTINGS), 4)
 
-        # 2. Self-evaluation policy checker catches premature trade-in and unprompted buzzwords
+        # 1. Self-evaluation policy checker catches premature trade-in and unprompted buzzwords
         eval_res = evaluate_agent_response_policy(
             response_text="Ask the dealer about their 2% holdback and floorplan and mention my trade-in.",
             dealer_initiated_jargon=False,
@@ -637,7 +602,7 @@ class TestCarNegotiator(unittest.TestCase):
         self.assertFalse(eval_res["passed"])
         self.assertGreaterEqual(len(eval_res["violations"]), 2)
 
-        # 3. Human-in-the-loop confirmation gate defaults COPILOT to PENDING_APPROVAL
+        # 2. Human-in-the-loop confirmation gate defaults COPILOT to PENDING_APPROVAL
         gate_copilot = require_human_confirmation_hook(
             action_name="queue_dealer_message",
             action_payload={"dealer_id": "dlr-raceway-kia-of-freehold"},
@@ -648,26 +613,21 @@ class TestCarNegotiator(unittest.TestCase):
         self.assertFalse(gate_copilot["approved"])
         self.assertEqual(gate_copilot["recommended_status"], "PENDING_APPROVAL")
 
-    def test_observability_tracing_and_pii_redaction(self):
-        raw_text = (
-            "Contact buyer Alex at alex.buyer@gmail.com or (732) 555-0199, "
-            "SSN 123-45-6789, regarding VIN 5XYPDESA8VG041820."
+    def test_observability_structured_logging_and_tool_instrumentation(self):
+        ev = log_structured_event(
+            event_type="TEST_EVENT",
+            message="Structured logging check",
+            component="test_suite",
         )
-        scrubbed = redact_pii(raw_text)
-        self.assertNotIn("alex.buyer@gmail.com", scrubbed)
-        self.assertNotIn("123-45-6789", scrubbed)
-        self.assertIn("[REDACTED_EMAIL]", scrubbed)
-        self.assertIn("[REDACTED_SSN]", scrubbed)
-        # VIN must be preserved
-        self.assertIn("5XYPDESA8VG041820", scrubbed)
+        self.assertEqual(ev["event_type"], "TEST_EVENT")
+        intent_ev = log_tool_intent("calculate_otd_price", {"msrp": 53890.0})
+        self.assertEqual(intent_ev["phase"], "INTENT_BEFORE_EXECUTION")
+        outcome_ev = log_tool_outcome("calculate_otd_price", {"ok": True}, latency_ms=1.5)
+        self.assertEqual(outcome_ev["phase"], "OUTCOME_AFTER_EXECUTION")
 
-        with start_trace_span("test.custom_span", attributes={"email": "test@example.com"}):
-            pass
-        traces = get_trace_history(limit=10)
-        self.assertGreaterEqual(len(traces), 1)
-
-    def test_secret_manager_and_iac_files_present(self):
-        env_text = (BASE_DIR / ".env").read_text(encoding="utf-8")
+    def test_secret_manager_and_config_files_present(self):
+        env_path = BASE_DIR / ".env"
+        env_text = env_path.read_text(encoding="utf-8") if env_path.is_file() else (BASE_DIR / ".env.example").read_text(encoding="utf-8")
         js_text = (BASE_DIR / "public" / "negotiator.js").read_text(encoding="utf-8")
         self.assertNotIn("AIza", env_text, ".env must not contain hardcoded plaintext Google API keys")
         self.assertNotIn("AQ.Ab8", env_text, ".env must not contain hardcoded tokens")
@@ -675,17 +635,14 @@ class TestCarNegotiator(unittest.TestCase):
         self.assertNotIn("generativelanguage.googleapis.com", js_text, "negotiator.js must not call Gemini directly with a client-side API key")
         self.assertTrue((BASE_DIR / ".env.example").is_file())
         self.assertTrue((BASE_DIR / ".gitignore").is_file())
-        self.assertTrue((BASE_DIR / "Dockerfile").is_file())
         self.assertTrue((BASE_DIR / "requirements.txt").is_file())
         self.assertTrue((BASE_DIR / "firebase.json").is_file())
-        self.assertTrue((BASE_DIR / "firestore.rules").is_file())
 
-        doc = async_upsert_document(
+        doc = upsert_document(
             "negotiation_campaigns",
             "camp-2027-kia-telluride-hybrid-nj",
             get_negotiation_dashboard()["campaign"],
         )
-        flush_async_persistence_queue(timeout=2.0)
         self.assertIn("updated_at", doc)
         self.assertIsInstance(get_secret("NON_EXISTENT_SECRET_KEY", default="fallback_val"), str)
 
